@@ -5,5 +5,6 @@
         "eamodio.gitlens",
         "EditorConfig.EditorConfig",
         "streetsidesoftware.code-spell-checker",
+        "alibaba-cloud.tongyi-lingma",
     ]
 }
