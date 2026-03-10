@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { 
   Box, 
   Button, 
@@ -11,7 +11,12 @@ import {
   ListItem,
   ListItemText,
   Divider,
-  CircularProgress
+  CircularProgress,
+  TextField,
+  FormControl,
+  InputLabel,
+  Select,
+  MenuItem
 } from '@mui/material';
 
 // API接口定义
@@ -63,6 +68,9 @@ class WebSocketClient {
   private url: string;
   private onMessage: (event: WsEvent) => void;
   private onError: (error: string) => void;
+  private reconnectAttempts: number = 0;
+  private maxReconnectAttempts: number = 5;
+  private reconnectTimeout: NodeJS.Timeout | null = null;
 
   constructor(url: string, onMessage: (event: WsEvent) => void, onError: (error: string) => void) {
     this.url = url;
@@ -72,15 +80,19 @@ class WebSocketClient {
 
   connect() {
     try {
-      this.ws = new WebSocket(this.url);
+      // 从环境变量获取服务URL，如果没有则使用默认值
+      const serviceUrl = process.env.REACT_APP_SERVICE_URL || 'ws://localhost:8080/ws';
+      this.ws = new WebSocket(serviceUrl);
       
       this.ws.onopen = () => {
         console.log('WebSocket connected');
+        this.reconnectAttempts = 0;
       };
 
       this.ws.onmessage = (event) => {
-        // 这里应该是解密后的消息，简化处理
         try {
+          // 在实际实现中，这里应该是解密后的消息
+          // 由于simple-gui主要用于演示，我们假设消息已经是JSON格式
           const data = JSON.parse(event.data as string);
           this.onMessage(data);
         } catch (error) {
@@ -95,7 +107,14 @@ class WebSocketClient {
 
       this.ws.onclose = () => {
         console.log('WebSocket disconnected');
-        this.onError('WebSocket disconnected');
+        if (this.reconnectAttempts < this.maxReconnectAttempts) {
+          this.reconnectAttempts++;
+          this.reconnectTimeout = setTimeout(() => {
+            this.connect();
+          }, 1000 * this.reconnectAttempts);
+        } else {
+          this.onError('WebSocket disconnected - max reconnect attempts reached');
+        }
       };
     } catch (error) {
       this.onError('Failed to connect to WebSocket');
@@ -124,6 +143,9 @@ class WebSocketClient {
   }
 
   close() {
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout);
+    }
     if (this.ws) {
       this.ws.close();
     }
@@ -136,20 +158,41 @@ const SimpleGPGUI: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [wsClient, setWsClient] = useState<WebSocketClient | null>(null);
   const [connected, setConnected] = useState(false);
+  const [portalUrl, setPortalUrl] = useState('');
+  const [gateways, setGateways] = useState<Array<{name: string, address: string}>>([]);
+  const [selectedGateway, setSelectedGateway] = useState<string>('');
+
+  const wsClientRef = useRef<WebSocketClient | null>(null);
 
   // 初始化WebSocket连接
   useEffect(() => {
-    const wsUrl = 'ws://localhost:8080/ws'; // 假设服务运行在8080端口
     const client = new WebSocketClient(
-      wsUrl,
+      '',
       (event: WsEvent) => {
         if (event.type === 'VpnState') {
-          setVpnState(event.data as VpnState);
-          setConnected((event.data as VpnState).type === 'Connected');
+          const state = event.data as VpnState;
+          setVpnState(state);
+          setConnected(state.type === 'Connected');
+          
+          // 更新网关列表
+          if (state.info?.gateways) {
+            setGateways(state.info.gateways);
+            if (state.info.gateways.length > 0) {
+              setSelectedGateway(state.info.gateways[0].address);
+            }
+          }
         } else if (event.type === 'VpnEnv') {
           const env = event.data as VpnEnv;
           setVpnState(env.vpnState);
           setConnected(env.vpnState.type === 'Connected');
+          
+          // 更新网关列表
+          if (env.vpnState.info?.gateways) {
+            setGateways(env.vpnState.info.gateways);
+            if (env.vpnState.info.gateways.length > 0) {
+              setSelectedGateway(env.vpnState.info.gateways[0].address);
+            }
+          }
         }
       },
       (errorMessage: string) => {
@@ -158,6 +201,7 @@ const SimpleGPGUI: React.FC = () => {
     );
 
     client.connect();
+    wsClientRef.current = client;
     setWsClient(client);
 
     return () => {
@@ -166,44 +210,62 @@ const SimpleGPGUI: React.FC = () => {
   }, []);
 
   const handleConnect = useCallback(async () => {
-    if (!wsClient) return;
+    if (!wsClientRef.current || !portalUrl.trim()) return;
     
     setLoading(true);
     setError(null);
     
     try {
-      // 这里应该从认证流程获取cookie，简化处理使用假数据
-      const mockConnectRequest: ConnectRequest = {
+      // 验证门户URL格式
+      let validPortalUrl = portalUrl.trim();
+      if (!validPortalUrl.startsWith('http')) {
+        validPortalUrl = 'https://' + validPortalUrl;
+      }
+      
+      // 尝试解析URL
+      new URL(validPortalUrl);
+      
+      // 获取认证cookie - 这里应该调用gpauth工具
+      // 由于simple-gui是演示用途，我们模拟这个过程
+      const mockCookie = await getAuthCookie(validPortalUrl);
+      
+      if (!mockCookie) {
+        throw new Error('Authentication failed');
+      }
+      
+      // 构建网关列表
+      const gatewayList = gateways.length > 0 
+        ? gateways 
+        : [{
+            name: 'Default Gateway',
+            address: new URL(validPortalUrl).hostname
+          }];
+      
+      const selectedGatewayInfo = gatewayList.find(gw => gw.address === selectedGateway) || gatewayList[0];
+      
+      const connectRequest: ConnectRequest = {
         info: {
-          portal: 'https://vpn.example.com',
-          gateway: {
-            name: 'Main Gateway',
-            address: 'gateway.example.com'
-          },
-          gateways: [
-            {
-              name: 'Main Gateway',
-              address: 'gateway.example.com'
-            }
-          ]
+          portal: validPortalUrl,
+          gateway: selectedGatewayInfo,
+          gateways: gatewayList
         },
-        cookie: 'mock-cookie-data'
+        cookie: mockCookie
       };
       
-      wsClient.sendConnectRequest(mockConnectRequest);
-    } catch (err) {
-      setError('Failed to connect VPN');
+      wsClientRef.current.sendConnectRequest(connectRequest);
+    } catch (err: any) {
+      setError(err.message || 'Failed to connect VPN');
       setLoading(false);
     }
-  }, [wsClient]);
+  }, [portalUrl, selectedGateway, gateways]);
 
   const handleDisconnect = useCallback(() => {
-    if (!wsClient) return;
+    if (!wsClientRef.current) return;
     
     setLoading(true);
-    wsClient.sendDisconnectRequest();
+    wsClientRef.current.sendDisconnectRequest();
     // 状态会通过WebSocket事件自动更新
-  }, [wsClient]);
+  }, []);
 
   const renderStatus = () => {
     switch (vpnState.type) {
@@ -248,11 +310,48 @@ const SimpleGPGUI: React.FC = () => {
       <Card>
         <CardContent>
           <Typography variant="h4" component="h1" gutterBottom align="center">
-            GlobalProtect VPN Client
+            GlobalProtect VPN Client (Simple GUI)
           </Typography>
           
           <Divider sx={{ my: 2 }} />
           
+          {/* Portal URL Input */}
+          {!isConnected && (
+            <Box mb={3}>
+              <TextField
+                fullWidth
+                label="Portal URL"
+                placeholder="https://vpn.example.com"
+                value={portalUrl}
+                onChange={(e) => setPortalUrl(e.target.value)}
+                disabled={isConnecting}
+                error={!portalUrl.trim() && loading}
+                helperText={!portalUrl.trim() && loading ? "Portal URL is required" : ""}
+              />
+            </Box>
+          )}
+
+          {/* Gateway Selection */}
+          {!isConnected && gateways.length > 1 && (
+            <Box mb={3}>
+              <FormControl fullWidth>
+                <InputLabel>Gateway</InputLabel>
+                <Select
+                  value={selectedGateway}
+                  label="Gateway"
+                  onChange={(e) => setSelectedGateway(e.target.value as string)}
+                  disabled={isConnecting}
+                >
+                  {gateways.map((gateway) => (
+                    <MenuItem key={gateway.address} value={gateway.address}>
+                      {gateway.name} ({gateway.address})
+                    </MenuItem>
+                  ))}
+                </Select>
+              </FormControl>
+            </Box>
+          )}
+
           {/* Status Section */}
           <Box display="flex" alignItems="center" justifyContent="space-between" mb={3}>
             <Typography variant="h6">Status:</Typography>
@@ -260,7 +359,7 @@ const SimpleGPGUI: React.FC = () => {
           </Box>
 
           {/* Progress Indicator */}
-          {(vpnState.type === 'Connecting' || vpnState.type === 'Disconnecting' || loading) && (
+          {(isConnecting || vpnState.type === 'Disconnecting') && (
             <Box mb={2}>
               <LinearProgress />
             </Box>
@@ -268,25 +367,25 @@ const SimpleGPGUI: React.FC = () => {
 
           {/* Action Buttons */}
           <Box display="flex" gap={2} justifyContent="center" mb={3}>
-            {!connected ? (
+            {!isConnected ? (
               <Button
                 variant="contained"
                 color="primary"
                 onClick={handleConnect}
-                disabled={loading || vpnState.type === 'Connecting'}
-                startIcon={loading && !connected ? <CircularProgress size={20} /> : null}
+                disabled={isConnecting || !portalUrl.trim()}
+                startIcon={isConnecting ? <CircularProgress size={20} /> : null}
               >
-                {loading && !connected ? 'Connecting...' : 'Connect'}
+                {isConnecting ? 'Connecting...' : 'Connect'}
               </Button>
             ) : (
               <Button
                 variant="contained"
                 color="secondary"
                 onClick={handleDisconnect}
-                disabled={loading || vpnState.type === 'Disconnecting'}
-                startIcon={loading && connected ? <CircularProgress size={20} /> : null}
+                disabled={vpnState.type === 'Disconnecting'}
+                startIcon={vpnState.type === 'Disconnecting' ? <CircularProgress size={20} /> : null}
               >
-                {loading && connected ? 'Disconnecting...' : 'Disconnect'}
+                {vpnState.type === 'Disconnecting' ? 'Disconnecting...' : 'Disconnect'}
               </Button>
             )}
           </Box>
@@ -304,9 +403,9 @@ const SimpleGPGUI: React.FC = () => {
           {/* Connection Tips */}
           <Box mt={3} p={2} bgcolor="#f5f5f5" borderRadius={1}>
             <Typography variant="body2" color="text.secondary">
-              <strong>Tip:</strong> This is a simplified GUI interface for GlobalProtect VPN.
-              In a real implementation, you would need to handle authentication flows,
-              certificate management, and proper encryption/decryption of WebSocket messages.
+              <strong>Note:</strong> This is a simplified GUI for development and testing purposes.
+              For production use, please use the official gpgui application or the CLI client (gpclient).
+              The actual implementation requires proper authentication integration with gpauth and encrypted WebSocket communication.
             </Typography>
           </Box>
         </CardContent>
